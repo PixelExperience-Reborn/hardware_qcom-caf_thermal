@@ -76,7 +76,9 @@ jobs:
           assert Path("thermalMonitorNetlink.cpp").is_file()
           print("PASS: HIDL 2.0 replaced by AIDL v3 with waipio and modern kernel thermal netlink")
           PY
-          git diff --check HEAD^1 HEAD
+          # Check only deviations from the verified modern upstream parent.
+          # Upstream itself contains a harmless extra EOF newline in its VINTF XML.
+          git diff --check "$upstream" HEAD
           git push origin HEAD:refs/heads/integrate/a17-qcom-thermal-aidl-20261105
 
       - name: Device and Soong validation boundary
