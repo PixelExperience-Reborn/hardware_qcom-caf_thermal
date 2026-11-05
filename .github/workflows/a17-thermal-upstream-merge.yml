@@ -65,8 +65,8 @@ jobs:
           assert root.find("./hal[@format='aidl']/name").text == "android.hardware.thermal"
           assert root.find("./hal[@format='aidl']/version").text == "3"
           config = Path("thermalConfig.cpp").read_text()
-          assert "sensor_cfg_waipio" in config
-          assert "sensor_cfg_kalama" in config
+          assert "waipio_common" in config and "waipio_specific" in config
+          assert "kalama_common" in config and "kalama_specific" in config
           assert "namespace aidl" in config
           assert "namespace V2_0" not in config
           main = Path("thermal.cpp").read_text()
