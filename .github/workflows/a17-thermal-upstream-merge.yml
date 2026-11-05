@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Integrate modern AIDL Thermal HAL while retaining PE git history
+      - name: Merge modern Qualcomm AIDL Thermal with older PixelExperience history
         shell: bash
         run: |
           set -euo pipefail
@@ -28,32 +28,59 @@ jobs:
           git fetch --no-tags modern refs/heads/lineage-24.0
           upstream="$(git rev-parse FETCH_HEAD^{commit})"
           test "$upstream" = "e2ff2bbb4a90503f88d2caa103fb6ed483601043"
-          if ! git merge --no-edit --no-ff --allow-unrelated-histories \
-              -m "merge: modern Qualcomm thermal AIDL implementation with PE history" "$upstream"; then
-            echo "::error::Thermal HAL merge conflicts need explicit compatibility review. No source pushed."
-            git diff --name-only --diff-filter=U
-            git status --short
-            exit 1
+
+          if git merge --no-edit --no-ff --allow-unrelated-histories \
+              -m "merge: Android17 Qualcomm Thermal AIDL with historic PE" "$upstream"; then
+            echo "Merged without source conflicts"
+          else
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            expected="$(printf '%s\n' Android.bp thermal.cpp thermalConfig.cpp)"
+            if [ "$conflicts" != "$expected" ]; then
+              echo "::error::Unexpected thermal conflict files, no sources pushed"
+              git diff --name-only --diff-filter=U
+              exit 1
+            fi
+            # HIDL 2.0 structs, service and thermal config cannot be mixed
+            # with Android17 AIDL v3. Use the modern mutually compatible
+            # trio after review. Other files retain their normal git merge.
+            git checkout --theirs -- Android.bp thermal.cpp thermalConfig.cpp
+            git add Android.bp thermal.cpp thermalConfig.cpp
+            git commit -m "merge: resolve HIDL-to-AIDL thermal source conflicts for Android17"
           fi
+
           git merge-base --is-ancestor "$upstream" HEAD
+          git merge-base --is-ancestor "f6ed211105031013ec0ba806405f92a21ec666e9" HEAD
           python3 - <<'PY'
           from pathlib import Path
           import xml.etree.ElementTree as ET
           bp = Path("Android.bp").read_text()
-          assert 'name: "android.hardware.thermal-service.qti"' in bp
+          assert bp.count('name: "android.hardware.thermal-service.qti"') == 1
           assert '"android.hardware.thermal-V3-ndk"' in bp
           assert 'name: "android.hardware.thermal@2.0-service.qti"' not in bp
+          assert 'name: "android.hardware.thermal@2.0-service.qti-v2"' not in bp
+          assert 'name: "aidl_fuzzer_thermal"' in bp
           rc = Path("android.hardware.thermal-service.qti.rc").read_text()
           assert "interface aidl android.hardware.thermal.IThermal/default" in rc
           root = ET.parse("android.hardware.thermal-service.qti.xml").getroot()
           assert root.find("./hal[@format='aidl']/name").text == "android.hardware.thermal"
           assert root.find("./hal[@format='aidl']/version").text == "3"
-          print("PASS: modern Thermal AIDL v3 source + VINTF + init")
+          config = Path("thermalConfig.cpp").read_text()
+          assert "sensor_cfg_waipio" in config
+          assert "sensor_cfg_kalama" in config
+          assert "namespace aidl" in config
+          assert "namespace V2_0" not in config
+          main = Path("thermal.cpp").read_text()
+          assert "namespace aidl" in main
+          assert "namespace V2_0" not in main
+          assert Path("thermalUtilsNetlink.cpp").is_file()
+          assert Path("thermalMonitorNetlink.cpp").is_file()
+          print("PASS: HIDL 2.0 replaced by AIDL v3 with waipio and modern kernel thermal netlink")
           PY
           git diff --check HEAD^1 HEAD
           git push origin HEAD:refs/heads/integrate/a17-qcom-thermal-aidl-20261105
-      - name: Review boundary
+
+      - name: Device and Soong validation boundary
         if: always()
         run: |
-          echo "Source/VINTF review only; actual Android17 Soong and hardware sensors are not tested."
-          echo "Do not activate until Qualcomm common kernel headers and device thermal policy are reviewed."
+          echo "AIDL thermal source merge only. Android17 Soong/VINTF/SELinux and mondrian thermal runtime still pending."
+          echo "Do not enable old vendor thermal-engine overrides or disable thermal mitigation."
