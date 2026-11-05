@@ -1,0 +1,59 @@
+name: Android17 PE Qualcomm thermal AIDL source integration
+
+on:
+  push:
+    branches:
+      - integrate/a17-qcom-thermal-aidl-20261105
+    paths:
+      - .github/workflows/a17-thermal-upstream-merge.yml
+
+permissions:
+  contents: write
+
+jobs:
+  merge-thermal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Integrate modern AIDL Thermal HAL while retaining PE git history
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/integrate/a17-qcom-thermal-aidl-20261105"
+          git config user.name "PixelExperience-Reborn CI"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add modern https://github.com/LineageOS/android_hardware_qcom_thermal.git
+          git fetch --no-tags modern refs/heads/lineage-24.0
+          upstream="$(git rev-parse FETCH_HEAD^{commit})"
+          test "$upstream" = "e2ff2bbb4a90503f88d2caa103fb6ed483601043"
+          if ! git merge --no-edit --no-ff --allow-unrelated-histories \
+              -m "merge: modern Qualcomm thermal AIDL implementation with PE history" "$upstream"; then
+            echo "::error::Thermal HAL merge conflicts need explicit compatibility review. No source pushed."
+            git diff --name-only --diff-filter=U
+            git status --short
+            exit 1
+          fi
+          git merge-base --is-ancestor "$upstream" HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          bp = Path("Android.bp").read_text()
+          assert 'name: "android.hardware.thermal-service.qti"' in bp
+          assert '"android.hardware.thermal-V3-ndk"' in bp
+          assert 'name: "android.hardware.thermal@2.0-service.qti"' not in bp
+          rc = Path("android.hardware.thermal-service.qti.rc").read_text()
+          assert "interface aidl android.hardware.thermal.IThermal/default" in rc
+          root = ET.parse("android.hardware.thermal-service.qti.xml").getroot()
+          assert root.find("./hal[@format='aidl']/name").text == "android.hardware.thermal"
+          assert root.find("./hal[@format='aidl']/version").text == "3"
+          print("PASS: modern Thermal AIDL v3 source + VINTF + init")
+          PY
+          git diff --check HEAD^1 HEAD
+          git push origin HEAD:refs/heads/integrate/a17-qcom-thermal-aidl-20261105
+      - name: Review boundary
+        if: always()
+        run: |
+          echo "Source/VINTF review only; actual Android17 Soong and hardware sensors are not tested."
+          echo "Do not activate until Qualcomm common kernel headers and device thermal policy are reviewed."
