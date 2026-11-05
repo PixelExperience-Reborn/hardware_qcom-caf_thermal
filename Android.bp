@@ -1,49 +1,21 @@
-cc_binary {
-	name: "android.hardware.thermal@2.0-service.qti",
-	defaults: [
-		"hidl_defaults",
-	],
-	vendor: true,
-	relative_install_path: "hw",
-	init_rc: ["android.hardware.thermal@2.0-service.qti.rc"],
-	vintf_fragments: ["android.hardware.thermal@2.0-service.qti.xml"],
-	srcs: [
-		"service.cpp",
-		"thermal.cpp",
-		"thermalConfig.cpp",
-		"thermalCommon.cpp",
-		"thermalUtils.cpp",
-		"thermalMonitor.cpp",
-	],
-	shared_libs: [
-		"libbase",
-		"libcutils",
-		"libhidlbase",
-		"libutils",
-		"liblog",
-		"android.hardware.thermal@1.0",
-		"android.hardware.thermal@2.0",
-	],
-	header_libs: [
-		"liblog_headers",
-		"libcutils_headers"
-	],
-	cflags: [
-		"-Wno-unused-parameter",
-		"-Wno-unused-variable",
-		"-fexceptions",
-	],
+soong_namespace {
 }
 
 cc_binary {
-	name: "android.hardware.thermal@2.0-service.qti-v2",
-	defaults: [
-		"hidl_defaults",
-	],
-	vendor: true,
+	name: "android.hardware.thermal-service.qti",
 	relative_install_path: "hw",
-	init_rc: ["android.hardware.thermal@2.0-service.qti-v2.rc"],
-	vintf_fragments: ["android.hardware.thermal@2.0-service.qti.xml"],
+	init_rc: ["android.hardware.thermal-service.qti.rc"],
+	vintf_fragments: ["android.hardware.thermal-service.qti.xml"],
+	vendor: true,
+	shared_libs: [
+	"libbase",
+	"libbinder_ndk",
+	"android.hardware.thermal-V3-ndk",
+	"libcutils",
+	"libutils",
+	"liblog",
+	"libnl",
+	],
 	srcs: [
 		"service.cpp",
 		"thermal.cpp",
@@ -51,16 +23,6 @@ cc_binary {
 		"thermalCommon.cpp",
 		"thermalUtilsNetlink.cpp",
 		"thermalMonitorNetlink.cpp",
-	],
-	shared_libs: [
-		"libbase",
-		"libcutils",
-		"libhidlbase",
-		"libutils",
-		"liblog",
-		"libnl",
-		"android.hardware.thermal@1.0",
-		"android.hardware.thermal@2.0",
 	],
 	header_libs: [
 		"liblog_headers",
@@ -73,4 +35,46 @@ cc_binary {
 		"-DENABLE_THERMAL_NETLINK",
 		"-fexceptions",
 	],
+}
+
+cc_fuzz {
+    name: "aidl_fuzzer_thermal",
+    vendor: true,
+
+    shared_libs: [
+        "liblog",
+        "libbase",
+        "libutils",
+        "libcutils",
+        "libbinder",
+        "libbinder_ndk",
+        "android.hardware.thermal-V3-ndk",
+        "libnl",
+    ],
+
+    srcs: [
+        "fuzzer.cpp",
+        "thermal.cpp",
+        "thermalConfig.cpp",
+        "thermalCommon.cpp",
+        "thermalUtilsNetlink.cpp",
+        "thermalMonitorNetlink.cpp",
+    ],
+    header_libs: [
+        "liblog_headers",
+        "libcutils_headers",
+        "qti_kernel_headers"
+    ],
+
+    cflags: [
+        "-Wno-unused-parameter",
+        "-Wno-unused-variable",
+        "-DENABLE_THERMAL_NETLINK",
+        "-fexceptions",
+    ],
+
+    static_libs: [
+        "libbinder_random_parcel",
+    ],
+
 }

@@ -26,40 +26,12 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * Changes from Qualcomm Innovation Center are provided under the following license:
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted (subject to the limitations in the
- * disclaimer below) provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright
- *     notice, this list of conditions and the following disclaimer.
- *
- *   * Redistributions in binary form must reproduce the above
- *     copyright notice, this list of conditions and the following
- *     disclaimer in the documentation and/or other materials provided
- *     with the distribution.
- *
- *   * Neither the name of Qualcomm Innovation Center, Inc. nor the names of its
- *     contributors may be used to endorse or promote products derived
- *     from this software without specific prior written permission.
- *
- * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE
- * GRANTED BY THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT
- * HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
- * GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
- * IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
- * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
- * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+/* Changes from Qualcomm Innovation Center are provided under the following license:
+
+Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause-Clear */
 
 #include <ctype.h>
 #include <errno.h>
@@ -71,244 +43,299 @@
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
-#include <hidl/HidlTransportSupport.h>
 
 #include "thermal.h"
 
-namespace android {
-namespace hardware {
-namespace thermal {
-namespace V2_0 {
-namespace implementation {
+namespace aidl::android::hardware::thermal{
 
-using ::android::hardware::interfacesEqual;
+using ndk::ScopedAStatus;
 
-static const Temperature_1_0 dummy_temp_1_0 = {
-	.type = TemperatureType_1_0::SKIN,
-	.name = "test sensor",
-	.currentValue = 30,
-	.throttlingThreshold = 40,
-	.shutdownThreshold = 60,
-	.vrThrottlingThreshold = 40,
-};
+namespace {
 
-static const Temperature dummy_temp_2_0 = {
+bool interfacesEqual(const std::shared_ptr<::ndk::ICInterface>& left,
+				const std::shared_ptr<::ndk::ICInterface>& right) {
+	if (left == nullptr || right == nullptr || !left->isRemote() || !right->isRemote()) {
+		return left == right;
+	}
+    return left->asBinder() == right->asBinder();
+}
+
+}// namespace
+
+static const Temperature dummy_temp_1_0 = {
 	.type = TemperatureType::SKIN,
 	.name = "test sensor",
-	.value = 25.0,
+	.value = 30,
 	.throttlingStatus = ThrottlingSeverity::NONE,
 };
 
-template <typename A, typename B>
-Return<void> exit_hal(A _cb, hidl_vec<B> _data, std::string_view _msg) {
-	ThermalStatus _status;
-
-	_status.code = ThermalStatusCode::FAILURE;
-	_status.debugMessage = _msg.data();
-	LOG(ERROR) << _msg;
-	_cb(_status, _data);
-
-	return Void();
-}
-
-template <typename A>
-Return<void> exit_hal(A _cb, std::string_view _msg) {
-	ThermalStatus _status;
-
-	_status.code = ThermalStatusCode::FAILURE;
-	_status.debugMessage = _msg.data();
-	LOG(ERROR) << _msg;
-	_cb(_status);
-
-	return Void();
-}
-
 Thermal::Thermal():
 	utils(std::bind(&Thermal::sendThrottlingChangeCB, this,
+				std::placeholders::_1),
+		std::bind(&Thermal::sendCoolingDeviceChangeCB, this,
 				std::placeholders::_1))
 { }
 
-Return<void> Thermal::getTemperatures(getTemperatures_cb _hidl_cb)
-{
-	ThermalStatus status;
-	hidl_vec<Temperature_1_0> temperatures;
+ScopedAStatus Thermal::getCoolingDevices(std::vector<CoolingDevice>* out_data) {
 
-	status.code = ThermalStatusCode::SUCCESS;
+	std::vector<CoolingDevice> cdev;
+
+	if (!utils.isCdevInitialized())
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_STATE,
+						"ThermalHAL given cdev not initialized.");
+	else {
+		if (utils.readCdevStates(cdev) <= 0)
+			LOG(VERBOSE) << __func__ << "Failed to read thermal cooling devices.";
+	}
+
+	if (out_data != nullptr)
+		*out_data = std::move(cdev);
+
+	return ScopedAStatus::ok();
+}
+
+ScopedAStatus Thermal::getCoolingDevicesWithType(CoolingType in_type,
+				std::vector<CoolingDevice>* out_data) {
+
+	std::vector<CoolingDevice> cdev;
+
+	if (!utils.isCdevInitialized(in_type))
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_STATE,
+						"ThermalHAL given cdev type not initialized.");
+	else {
+		if (utils.readCdevStates(in_type, cdev) <= 0)
+			LOG(VERBOSE) << __func__ << "Failed to read thermal cooling devices.";
+	}
+
+	if (out_data != nullptr)
+		*out_data = std::move(cdev);
+
+	return ScopedAStatus::ok();
+}
+
+ScopedAStatus Thermal::getTemperatures(std::vector<Temperature>* out_temp) {
+	LOG(VERBOSE) << __func__;
+	std::vector<Temperature> temperatures;
+
 	if (!utils.isSensorInitialized()) {
-		std::vector<Temperature_1_0> _temp = {dummy_temp_1_0};
-		LOG(INFO) << "Returning Dummy Value" << std::endl;
-		_hidl_cb(status, _temp);
-		return Void();
+		std::vector<Temperature> _temp = {dummy_temp_1_0};
+		LOG(VERBOSE) << __func__ << " Returning Dummy Value";
+
+		if (out_temp != nullptr)
+			*out_temp = std::move(_temp);
+
+		return ScopedAStatus::ok();
 	}
 
 	if (utils.readTemperatures(temperatures) <= 0)
-		return exit_hal(_hidl_cb, temperatures,
-				"Sensor Temperature read failure.");
+		LOG(VERBOSE) << __func__ << "Sensor Temperature read failure.";
 
-	_hidl_cb(status, temperatures);
+	if (out_temp != nullptr)
+		*out_temp = std::move(temperatures);
 
-	return Void();
+	return ScopedAStatus::ok();
 }
 
-Return<void> Thermal::getCpuUsages(getCpuUsages_cb _hidl_cb)
-{
+ScopedAStatus Thermal::getTemperaturesWithType(TemperatureType in_type,
+					std::vector<Temperature>* out_temp) {
 
-	ThermalStatus status;
-	hidl_vec<CpuUsage> cpu_usages;
+	std::vector<Temperature> temperatures;
 
-	status.code = ThermalStatusCode::SUCCESS;
-	if (utils.fetchCpuUsages(cpu_usages) <= 0)
-		return exit_hal(_hidl_cb, cpu_usages,
-				"CPU usage read failure.");
+	if (!utils.isSensorInitialized(in_type))
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_STATE,
+					"ThermalHAL given sensor type not initialized.");
+	else {
+		if (utils.readTemperatures(in_type, temperatures) <= 0)
+			LOG(VERBOSE) << __func__ << "Sensor Temperature read failure.";
+	}
 
-	_hidl_cb(status, cpu_usages);
-	return Void();
+	if (out_temp != nullptr)
+		*out_temp = std::move(temperatures);
+
+	return ScopedAStatus::ok();
 }
 
-Return<void> Thermal::getCoolingDevices(getCoolingDevices_cb _hidl_cb)
-{
-	ThermalStatus status;
-	hidl_vec<CoolingDevice_1_0> cdev;
+ScopedAStatus Thermal::getTemperatureThresholds(std::vector<TemperatureThreshold>* out_temp_thresh) {
 
-	status.code = ThermalStatusCode::SUCCESS;
-	/* V1 Cdev requires only Fan Support. */
-	_hidl_cb(status, cdev);
-	return Void();
-}
+	std::vector<TemperatureThreshold> thresh;
 
-Return<void> Thermal::getCurrentCoolingDevices(
-				bool filterType,
-				cdevType type,
-				getCurrentCoolingDevices_cb _hidl_cb)
-{
-	ThermalStatus status;
-	hidl_vec<CoolingDevice> cdev;
-
-	status.code = ThermalStatusCode::SUCCESS;
-	if (!utils.isCdevInitialized())
-		return exit_hal(_hidl_cb, cdev,
-			"ThermalHAL not initialized properly.");
-	if (utils.readCdevStates(filterType, type, cdev) <= 0)
-		return exit_hal(_hidl_cb, cdev,
-			"Failed to read thermal cooling devices.");
-
-	_hidl_cb(status, cdev);
-	return Void();
-}
-
-Return<void> Thermal::getCurrentTemperatures(
-				bool filterType,
-				TemperatureType type,
-				getCurrentTemperatures_cb _hidl_cb)
-{
-	ThermalStatus status;
-	hidl_vec<Temperature> temperatures;
-
-	status.code = ThermalStatusCode::SUCCESS;
 	if (!utils.isSensorInitialized())
-		return exit_hal(_hidl_cb, temperatures,
-			"ThermalHAL not initialized properly.");
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_STATE,
+					"ThermalHAL for sensor not initialized.");
 
-	if (utils.readTemperatures(filterType, type, temperatures) <= 0) {
-		if (filterType && type != dummy_temp_2_0.type) {
-			status.code = ThermalStatusCode::FAILURE;
-			status.debugMessage = "Failed to read dummy temperature value";
-		} else {
-			temperatures = {dummy_temp_2_0};
-			LOG(INFO) << "Returning Dummy Temperature Value" << std::endl;
+	if (utils.readTemperatureThreshold(thresh) <= 0)
+		LOG(VERBOSE) << __func__ << "Sensor Threshold read failure or type not supported.";
+
+	if (out_temp_thresh != nullptr)
+		*out_temp_thresh = std::move(thresh);
+
+	return ScopedAStatus::ok();
+}
+
+ScopedAStatus Thermal::getTemperatureThresholdsWithType(
+		TemperatureType in_type,
+		std::vector<TemperatureThreshold>* out_temp_thresh) {
+
+	std::vector<TemperatureThreshold> thresh;
+
+	if (!utils.isSensorInitialized(in_type))
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_STATE,
+					"ThermalHAL given sensor type not initialized.");
+	else{
+		if (utils.readTemperatureThreshold(in_type, thresh) <= 0)
+			LOG(VERBOSE) << __func__ << "Sensor Threshold read failure or type not supported.";
+	}
+
+	if (out_temp_thresh != nullptr)
+		*out_temp_thresh = std::move(thresh);
+
+	return ScopedAStatus::ok();
+}
+
+ScopedAStatus Thermal::registerThermalChangedCallback(
+		const std::shared_ptr<IThermalChangedCallback>& in_callback) {
+
+	if (in_callback == nullptr) {
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+				"Invalid nullptr callback");
+	}
+
+	{
+		std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
+		TemperatureType in_type = TemperatureType::UNKNOWN;
+		for (CallbackSetting _cb: cb) {
+			if (interfacesEqual(_cb.callback, in_callback))
+				return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+								"Callback already registered");
 		}
+		cb.emplace_back(in_callback, in_type);
+		LOG(DEBUG) << "A callback has been registered to ThermalHAL ";
+	}
+	return ScopedAStatus::ok();
+}
+
+ScopedAStatus Thermal::registerThermalChangedCallbackWithType(
+		const std::shared_ptr<IThermalChangedCallback>& in_callback, TemperatureType in_type) {
+	LOG(VERBOSE) << __func__ << " IThermalChangedCallback: " << in_callback
+			<< ", TemperatureType: " << static_cast<int32_t>(in_type);
+	if (in_callback == nullptr) {
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+						"Invalid nullptr callback");
+	}
+	if (in_type == TemperatureType::BCL_VOLTAGE ||
+		in_type == TemperatureType::BCL_CURRENT)
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+					"BCL current and voltage notification not supported");
+	{
+		std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
+		for (CallbackSetting _cb: cb) {
+			if (interfacesEqual(_cb.callback, in_callback))
+				return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+								"Callback already registered");
+		}
+		cb.emplace_back(in_callback, in_type);
+		LOG(DEBUG) << "A callback has been registered to ThermalHAL Type: " << android::hardware::thermal::toString(in_type);
+	}
+	return ScopedAStatus::ok();
+}
+
+ScopedAStatus Thermal::unregisterThermalChangedCallback(
+		const std::shared_ptr<IThermalChangedCallback>& in_callback) {
+
+	if (in_callback == nullptr) {
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+						"Invalid nullptr callback");
 	}
 
-	_hidl_cb(status, temperatures);
-
-	return Void();
-}
-
-Return<void> Thermal::getTemperatureThresholds(
-				bool filterType,
-				TemperatureType type,
-				getTemperatureThresholds_cb _hidl_cb)
-{
-	ThermalStatus status;
-	hidl_vec<TemperatureThreshold> thresh;
-
-	status.code = ThermalStatusCode::SUCCESS;
-	if (!utils.isSensorInitialized())
-		return exit_hal(_hidl_cb, thresh,
-			"ThermalHAL not initialized properly.");
-
-	if (utils.readTemperatureThreshold(filterType, type, thresh) <= 0)
-		return exit_hal(_hidl_cb, thresh,
-		"Sensor Threshold read failure or type not supported.");
-
-	_hidl_cb(status, thresh);
-
-	return Void();
-}
-
-Return<void> Thermal::registerThermalChangedCallback(
-				const sp<IThermalChangedCallback> &callback,
-				bool filterType,
-				TemperatureType type,
-				registerThermalChangedCallback_cb _hidl_cb)
-{
-	ThermalStatus status;
-	std::lock_guard<std::mutex> _lock(thermal_cb_mutex);
-
-        status.code = ThermalStatusCode::SUCCESS;
-	if (callback == nullptr)
-		return exit_hal(_hidl_cb, "Invalid nullptr callback");
-	if (type == TemperatureType::BCL_VOLTAGE ||
-		type == TemperatureType::BCL_CURRENT)
-		return exit_hal(_hidl_cb,
-			"BCL current and voltage notification not supported");
-
-	for (CallbackSetting _cb: cb) {
-		if (interfacesEqual(_cb.callback, callback))
-			return exit_hal(_hidl_cb,
-				"Same callback interface registered already");
-	}
-	cb.emplace_back(callback, filterType, type);
-	LOG(DEBUG) << "A callback has been registered to ThermalHAL, isFilter: " << filterType
-		<< " Type: " << android::hardware::thermal::V2_0::toString(type);
-
-	_hidl_cb(status);
-	return Void();
-}
-
-Return<void> Thermal::unregisterThermalChangedCallback(
-				const sp<IThermalChangedCallback> &callback,
-				unregisterThermalChangedCallback_cb _hidl_cb)
-{
-
-	ThermalStatus status;
-	bool removed = false;
-	std::lock_guard<std::mutex> _lock(thermal_cb_mutex);
+	std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
 	std::vector<CallbackSetting>::iterator it;
-
-        status.code = ThermalStatusCode::SUCCESS;
-	if (callback == nullptr)
-		return exit_hal(_hidl_cb, "Invalid nullptr callback");
-
+	bool removed = false;
 	for (it = cb.begin(); it != cb.end(); it++) {
-		if (interfacesEqual(it->callback, callback)) {
+		if (interfacesEqual(it->callback, in_callback)) {
 			cb.erase(it);
-			LOG(DEBUG) << "callback unregistered. isFilter: "
-				<< it->is_filter_type << " Type: "
-				<< android::hardware::thermal::V2_0::toString(it->type);
+			LOG(DEBUG) << "callback unregistered. isFilter: ";
 			removed = true;
 			break;
 		}
 	}
-	if (!removed)
-		return exit_hal(_hidl_cb, "The callback was not registered before");
-	_hidl_cb(status);
-	return Void();
+	if (!removed) {
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+						"Callback wasn't registered");
+	}
+	LOG(DEBUG) << "A callback has been registered to ThermalHAL" ;
+
+	return ScopedAStatus::ok();
+}
+
+ScopedAStatus Thermal::registerCoolingDeviceChangedCallbackWithType(
+			const std::shared_ptr<ICoolingDeviceChangedCallback> &in_callback, CoolingType in_type)
+{
+	if (in_callback == nullptr)
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+						"Invalid nullptr callback");
+
+	std::lock_guard<std::mutex> _lock(cdev_callback_mutex_);
+	for (CdevCallbackSetting _cb: cdev_cb) {
+		if (interfacesEqual(_cb.callback, in_callback))
+			return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+					"Callback already registered");
+	}
+	cdev_cb.emplace_back(CdevCallbackSetting(in_callback, in_type));
+	LOG(DEBUG) << "CoolingDevice changed callback has been registered. Type: "<< android::hardware::thermal::toString(in_type);
+
+	return ScopedAStatus::ok();
+}
+
+ScopedAStatus Thermal::unregisterCoolingDeviceChangedCallback(
+		const std::shared_ptr<ICoolingDeviceChangedCallback> &in_callback) {
+	if (in_callback == nullptr)
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+						"Invalid nullptr callback");
+
+	std::lock_guard<std::mutex> _lock(cdev_callback_mutex_);
+	std::vector<CdevCallbackSetting>::iterator it;
+	bool removed = false;
+	for (auto it = cdev_cb.begin(); it != cdev_cb.end(); it++) {
+		if (interfacesEqual(it->callback, in_callback)) {
+			cdev_cb.erase(it);
+			removed = true;
+			break;
+		}
+	}
+	if (!removed) {
+		return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+					"CoolingDevice changed callback wasn't registered");
+	}
+	LOG(DEBUG) << "A CoolingDevice changed callback has been unregistered to CDEV" ;
+
+	return ScopedAStatus::ok();
+}
+
+void Thermal::sendCoolingDeviceChangeCB(const CoolingDevice &c)
+{
+	std::lock_guard<std::mutex> _lock(cdev_callback_mutex_);
+	std::vector<CdevCallbackSetting>::iterator it;
+
+	LOG(DEBUG) << "Cooling device Name: " << c.name <<
+	" type: " << (int)c.type << " cur_level: " << c.value;
+	it = cdev_cb.begin();
+	while (it != cdev_cb.end()) {
+		if (it->type == c.type) {
+			::ndk::ScopedAStatus ret = it->callback->notifyCoolingDeviceChanged(c);
+				if (!ret.isOk()) {
+					LOG(ERROR) << "Notify CoolingDevice changed callback execution error. Removing"
+								<<ret.getMessage();
+					it = cdev_cb.erase(it);
+					continue;
+				}
+		}
+		it++;
+	}
 }
 
 void Thermal::sendThrottlingChangeCB(const Temperature &t)
 {
-	std::lock_guard<std::mutex> _lock(thermal_cb_mutex);
+	std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
 	std::vector<CallbackSetting>::iterator it;
 
 	LOG(DEBUG) << "Throttle Severity change: " << " Type: " << (int)t.type
@@ -316,10 +343,10 @@ void Thermal::sendThrottlingChangeCB(const Temperature &t)
 		" ThrottlingStatus: " << (int)t.throttlingStatus;
 	it = cb.begin();
 	while (it != cb.end()) {
-		if (!it->is_filter_type || it->type == t.type) {
-			Return<void> ret = it->callback->notifyThrottling(t);
+		if (it->type == t.type || it->type == TemperatureType::UNKNOWN) {
+			::ndk::ScopedAStatus ret = it->callback->notifyThrottling(t);
 			if (!ret.isOk()) {
-				LOG(ERROR) << "Notify callback execution error. Removing";
+				LOG(ERROR) << "Notify callback execution error. Removing"<<ret.getMessage();
 				it = cb.erase(it);
 				continue;
 			}
@@ -328,8 +355,8 @@ void Thermal::sendThrottlingChangeCB(const Temperature &t)
 	}
 }
 
-}  // namespace implementation
-}  // namespace V2_0
-}  // namespace thermal
-}  // namespace hardware
-}  // namespace android
+ndk::ScopedAStatus Thermal::forecastSkinTemperature(int32_t forecastSeconds, float*_aidl_return) {
+    return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+}
+
+}  // namespace aidl::android::hardware::thermal

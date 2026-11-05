@@ -29,6 +29,11 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+ /* Changes from Qualcomm Innovation Center are provided under the following license:
+
+Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause-Clear */
+
 #include <unistd.h>
 #include <linux/thermal.h>
 #include <android-base/logging.h>
@@ -37,11 +42,10 @@
 
 #include "thermalMonitorNetlink.h"
 
+namespace aidl {
 namespace android {
 namespace hardware {
 namespace thermal {
-namespace V2_0 {
-namespace implementation {
 
 using pollCB = std::function<bool()>;
 using familyCB = std::function<int(struct nl_msg *, void *)>;
@@ -73,14 +77,16 @@ int thermal_family_cb(struct nl_msg *n, void *data)
 	return t->family_msg_cb(n, NULL);
 }
 
-ThermalMonitor::ThermalMonitor(const eventMonitorCB &inp_event_cb,
+ThermalMonitor::ThermalMonitor(const eventMonCB &inp_event_cb,
 				const eventMonitorCB &inp_sample_cb,
-				const eventCreateMonitorCB &inp_event_create_cb):
+				const eventCreateMonitorCB &inp_event_create_cb,
+				const eventMonitorCB &inp_event_cdev_cb):
 	event_group(-1),
 	sample_group(-1),
 	event_cb(inp_event_cb),
 	sample_cb(inp_sample_cb),
-	event_create_cb(inp_event_create_cb)
+	event_create_cb(inp_event_create_cb),
+	cdev_cb(inp_event_cdev_cb)
 {
 	monitor_shutdown = false;
 }
@@ -101,7 +107,7 @@ int ThermalMonitor::event_parse(struct nl_msg *n, void *data)
 	struct nlmsghdr *nl_hdr = nlmsg_hdr(n);
 	struct genlmsghdr *hdr = genlmsg_hdr(nl_hdr);
 	struct nlattr *attrs[THERMAL_GENL_ATTR_MAX + 1];
-	int tzn = -1, trip = -1;
+	int tzn = -1, trip = -1, cdev_id = -1, curr_state = -1, temp = INT_MIN;
 	const char *tz_name = "";
 
 	genlmsg_parse(nl_hdr, 0, attrs, THERMAL_GENL_ATTR_MAX, NULL);
@@ -115,9 +121,11 @@ int ThermalMonitor::event_parse(struct nl_msg *n, void *data)
 		if (attrs[THERMAL_GENL_ATTR_TZ_TRIP_ID])
 			trip = nla_get_u32(
 					attrs[THERMAL_GENL_ATTR_TZ_TRIP_ID]);
+		if (attrs[THERMAL_GENL_ATTR_TZ_TEMP])
+			temp = (int)nla_get_u32(attrs[THERMAL_GENL_ATTR_TZ_TEMP]);
 		LOG(DEBUG) << "thermal_nl_event: TZ:" << tzn << " Trip:"
-		       << trip << "event:" << (int)hdr->cmd << std::endl;
-		event_cb(tzn, trip);
+		       << trip << "Temp:" << temp << "event:" << (int)hdr->cmd << std::endl;
+		event_cb(tzn, trip, temp);
 		break;
 	case THERMAL_GENL_EVENT_TZ_CREATE:
 		if (attrs[THERMAL_GENL_ATTR_TZ_ID])
@@ -127,6 +135,15 @@ int ThermalMonitor::event_parse(struct nl_msg *n, void *data)
 		LOG(DEBUG) << "thermal_nl_event: TZ_CREATE: TZ:" << tzn << " TZ_NAME:"
 		       << tz_name << "event:" << (int)hdr->cmd << std::endl;
 		event_create_cb(tzn, tz_name);
+		break;
+	case THERMAL_GENL_EVENT_CDEV_STATE_UPDATE:
+		if (attrs[THERMAL_GENL_ATTR_CDEV_ID])
+			cdev_id = nla_get_u32(attrs[THERMAL_GENL_ATTR_CDEV_ID]);
+		if (attrs[THERMAL_GENL_ATTR_CDEV_CUR_STATE])
+			curr_state  = nla_get_u32(attrs[THERMAL_GENL_ATTR_CDEV_CUR_STATE]);
+		LOG(DEBUG) << "thermal_nl_event: CDEV:" << cdev_id <<
+				" curr_state :" << curr_state  << " event:" << (int)hdr->cmd<< std::endl;
+		cdev_cb(cdev_id, curr_state);
 		break;
 	}
 
@@ -151,7 +168,7 @@ int ThermalMonitor::sample_parse(struct nl_msg *n, void *data)
 		if (attrs[THERMAL_GENL_ATTR_TZ_TEMP])
 			temp = nla_get_u32(attrs[THERMAL_GENL_ATTR_TZ_TEMP]);
 
-		LOG(INFO) << "thermal_sample_event: TZ:" << tzn << " temp:"
+		LOG(DEBUG) << "thermal_sample_event: TZ:" << tzn << " temp:"
 			<< temp << std::endl;
 		sample_cb(tzn, temp);
 		break;
@@ -237,17 +254,17 @@ int ThermalMonitor::fetch_group_id(void)
 	nlmsg_free(msg);
 
 	if (event_group != -1 && sample_group != -1) {
-		LOG(DEBUG) << "Event: " << event_group <<
+		LOG(DEBUG) << "Netlink event: " << event_group <<
 			" Sample:" << sample_group << std::endl;
 		ret = nl_socket_add_membership(event_soc, event_group);
 		if (ret) {
-			LOG(ERROR) << "Event Socket membership add error\n";
+			LOG(ERROR) << "Netlink event Socket membership add error\n";
 			return ret;
 		}
 
 		ret = nl_socket_add_membership(sample_soc, sample_group);
 		if (ret) {
-			LOG(ERROR) << "sample Socket membership add error\n";
+			LOG(ERROR) << "Netlink sample Socket membership add error\n";
 			return ret;
 		}
 	}
@@ -260,26 +277,27 @@ void ThermalMonitor::start()
 
 	event_soc = nl_socket_alloc();
 	if (!event_soc) {
-		LOG(ERROR) << "Event socket alloc failed\n";
+		LOG(ERROR) << "Netlink Event socket alloc failed\n";
 		return;
 	}
 
 	if (genl_connect(event_soc)) {
-		LOG(ERROR) << "Event socket connect failed\n";
+		LOG(ERROR) << "Netlink Event socket connect failed\n";
 		nl_socket_free(event_soc);
 		event_soc = nullptr;
 		return;
 	}
+
 	sample_soc = nl_socket_alloc();
 	if (!sample_soc) {
-		LOG(ERROR) << "Sample socket alloc failed\n";
+		LOG(ERROR) << "Netlink Sample socket alloc failed\n";
 		nl_socket_free(event_soc);
 		event_soc = nullptr;
 		return;
 	}
 
 	if (genl_connect(sample_soc)) {
-		LOG(ERROR) << "Sample socket connect failed\n";
+		LOG(ERROR) << "Netlink Sample socket connect failed\n";
 		nl_socket_free(sample_soc);
 		nl_socket_free(event_soc);
 		event_soc = nullptr;
@@ -288,6 +306,7 @@ void ThermalMonitor::start()
 	}
 	if (fetch_group_id())
 		return;
+	LOG(DEBUG) << "Netlink connection established.\n";
 	nl_socket_disable_seq_check(sample_soc);
 	nl_socket_modify_cb(sample_soc, NL_CB_VALID, NL_CB_CUSTOM,
 			thermal_sample_cb, this);
@@ -301,8 +320,7 @@ void ThermalMonitor::start()
 		std::bind(&ThermalMonitor::stopPolling, this));
 }
 
-}  // namespace implementation
-}  // namespace V2_0
 }  // namespace thermal
 }  // namespace hardware
 }  // namespace android
+}  // namespace aidl

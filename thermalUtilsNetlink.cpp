@@ -27,94 +27,119 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * Changes from Qualcomm Innovation Center are provided under the following license:
- *
- * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met:
- *	* Redistributions of source code must retain the above copyright
- *	  notice, this list of conditions and the following disclaimer.
- *	* Redistributions in binary form must reproduce the above
- *	  copyright notice, this list of conditions and the following
- *	  disclaimer in the documentation and/or other materials provided
- *	  with the distribution.
- *	* Neither the name of Qualcomm Innovation Center, Inc. nor the
- *	  names of its contributors may be used to endorse or promote products
- *	  derived from this software without specific prior written permission.
- *
- *
- * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED
- * BY THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS
- * AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER
- * OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- *(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+/* Changes from Qualcomm Innovation Center are provided under the following license:
+
+Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause-Clear */
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <hidl/HidlTransportSupport.h>
 
 #include "thermalConfig.h"
 #include "thermalUtilsNetlink.h"
+#include "thermalCommon.h"
 
+namespace aidl {
 namespace android {
 namespace hardware {
 namespace thermal {
-namespace V2_0 {
-namespace implementation {
 
-ThermalUtils::ThermalUtils(const ueventCB &inp_cb):
+ThermalUtils::ThermalUtils(const ueventCB &inp_cb, const notifyCB &inp_cdev_cb):
 	cfg(),
-	cmnInst(),
+	cmnInst(std::bind(&ThermalUtils::virtualNotify, this,
+				std::placeholders::_1)),
 	monitor(std::bind(&ThermalUtils::eventParse, this,
 				std::placeholders::_1,
-				std::placeholders::_2),
+				std::placeholders::_2,
+				std::placeholders::_3),
 		std::bind(&ThermalUtils::sampleParse, this,
 				std::placeholders::_1,
 				std::placeholders::_2),
 		std::bind(&ThermalUtils::eventCreateParse, this,
 				std::placeholders::_1,
+				std::placeholders::_2),
+		std::bind(&ThermalUtils::cdevEventParse, this,
+				std::placeholders::_1,
 				std::placeholders::_2)),
-	cb(inp_cb)
+	cb(inp_cb),
+	notify(inp_cdev_cb)
 {
 	int ret = 0;
 	std::vector<struct therm_sensor> sensorList;
 	std::vector<struct target_therm_cfg> therm_cfg = cfg.fetchConfig();
 
-	is_sensor_init = false;
-	is_cdev_init = false;
 	ret = cmnInst.initThermalZones(therm_cfg);
 	if (ret > 0) {
-		is_sensor_init = true;
 		sensorList = cmnInst.fetch_sensor_list();
 		std::lock_guard<std::mutex> _lock(sens_cb_mutex);
 		for (struct therm_sensor sens: sensorList) {
 			thermalConfig[sens.tzn] = sens;
 			cmnInst.read_temperature(sens);
 			cmnInst.estimateSeverity(sens);
-			cmnInst.initThreshold(sens);
+			if (!sens.no_trip_set)
+				cmnInst.initThreshold(sens);
 		}
 	}
 	monitor.start();
 	ret = cmnInst.initCdev();
 	if (ret > 0) {
-		is_cdev_init = true;
 		cdevList = cmnInst.fetch_cdev_list();
+		std::lock_guard<std::mutex> _lock(cdev_cb_mutex);
+		for (struct therm_cdev cdevs: cdevList) {
+			cmnInst.read_cdev_state(cdevs);
+			cdev[cdevs.cdevn] = cdevs;
+		}
 	}
+}
+
+bool ThermalUtils::isSensorInitialized()
+{
+	std::lock_guard<std::mutex> _lock(sens_cb_mutex);
+
+	if (thermalConfig.begin() == thermalConfig.end())
+		return false;
+
+	return true;
+}
+
+bool ThermalUtils::isSensorInitialized(TemperatureType type)
+{
+	std::unordered_map<int, struct therm_sensor>::iterator it;
+	std::lock_guard<std::mutex> _lock(sens_cb_mutex);
+
+	if (thermalConfig.begin() == thermalConfig.end())
+		return false;
+
+	for (it = thermalConfig.begin(); it != thermalConfig.end();
+			it++) {
+		struct therm_sensor& sens = it->second;
+		if (sens.t.type == type)
+			return true;
+	}
+
+	return false;
+}
+
+bool ThermalUtils::isCdevInitialized(CoolingType type)
+{
+	for (struct therm_cdev cdev: cdevList)
+		if (cdev.c.type == type)
+			return true;
+
+	return false;
+}
+
+bool ThermalUtils::isCdevInitialized()
+{
+	if (cdev.begin() == cdev.end())
+		return false;
+
+	return true;
 }
 
 void ThermalUtils::Notify(struct therm_sensor& sens)
@@ -126,11 +151,64 @@ void ThermalUtils::Notify(struct therm_sensor& sens)
 			(int)sens.lastThrottleStatus << " new: " <<
 			(int)sens.t.throttlingStatus << std::endl;
 		cb(sens.t);
-		cmnInst.initThreshold(sens);
+		if (!sens.no_trip_set)
+			cmnInst.initThreshold(sens);
 	}
 }
 
-void ThermalUtils::eventParse(int tzn, int trip)
+void ThermalUtils::virtualNotify(struct therm_sensor *sens)
+{
+	cb(sens->t);
+}
+
+void ThermalUtils::cdevNotify(struct therm_cdev& cdev, int state)
+{
+
+	if (state > -1) {
+		cdev.c.value = state;
+
+		notify(cdev.c);
+	}
+
+}
+
+void ThermalUtils::cdevEventParse(int cdevn, int state)
+{
+	if (cdev.find(cdevn) == cdev.end()) {
+		LOG(DEBUG) << "cdev is not supported:" << cdevn
+			<< std::endl;
+		return;
+	}
+	std::lock_guard<std::mutex> _lock(cdev_cb_mutex);
+	struct therm_cdev& cdevs = cdev[cdevn];
+	return cdevNotify(cdevs, state);
+}
+
+void ThermalUtils::VirturalSensorEventParse(struct therm_sensor& sens,
+                                              int tzn, int temp)
+{
+	pthread_mutex_lock(&cmnInst.waitMutex);
+	if (temp >= sens.trip_sensor_thresholds) {
+		if (!cmnInst.pollingMode) {
+			cmnInst.pollingMode = true;
+			pthread_cond_broadcast(&cmnInst.waitCond);
+		}
+
+		if (!sens.no_trip_set)
+			cmnInst.initThreshold(sens);
+	} else if (temp < sens.trip_sensor_thresholds_clr) {
+		if (!sens.no_trip_set)
+			cmnInst.initThreshold(sens);
+
+		if (cmnInst.pollingMode) {
+			cmnInst.pollingMode = false;
+			pthread_cond_broadcast(&cmnInst.waitCond);
+		}
+	}
+	pthread_mutex_unlock(&cmnInst.waitMutex);
+}
+
+void ThermalUtils::eventParse(int tzn, int trip, int temp)
 {
 	if (trip != 1)
 		return;
@@ -141,7 +219,11 @@ void ThermalUtils::eventParse(int tzn, int trip)
 	}
 	std::lock_guard<std::mutex> _lock(sens_cb_mutex);
 	struct therm_sensor& sens = thermalConfig[tzn];
-	return Notify(sens);
+
+	if (!sens.virtual_sensor_flag)
+		return Notify(sens);
+
+	VirturalSensorEventParse(sens, tzn, temp);
 }
 
 void ThermalUtils::sampleParse(int tzn, int temp)
@@ -153,6 +235,8 @@ void ThermalUtils::sampleParse(int tzn, int temp)
 	}
 	std::lock_guard<std::mutex> _lock(sens_cb_mutex);
 	struct therm_sensor& sens = thermalConfig[tzn];
+	if (sens.virtual_sensor_flag)
+		return;
 	sens.t.value = (float)temp / (float)sens.mulFactor;
 	return Notify(sens);
 }
@@ -165,8 +249,9 @@ void ThermalUtils::eventCreateParse(int tzn, const char *name)
 	std::vector<struct target_therm_cfg>::iterator it_vec;
 	std::vector<std::string>::iterator it;
 
-	if (isSensorInitialized())
+	if (thermalConfig.find(tzn) != thermalConfig.end())
 		return;
+
 	for (it_vec = therm_cfg.begin();
 		it_vec != therm_cfg.end(); it_vec++) {
 		for (it = it_vec->sensor_list.begin();
@@ -182,58 +267,24 @@ void ThermalUtils::eventCreateParse(int tzn, const char *name)
 			<< std::endl;
 		return;
 	}
-	ret = cmnInst.initThermalZones(therm_cfg);
+	ret = cmnInst.initNewThermalZone(*it_vec);
 	if (ret > 0) {
-		is_sensor_init = true;
 		sensorList = cmnInst.fetch_sensor_list();
 		std::lock_guard<std::mutex> _lock(sens_cb_mutex);
 		for (struct therm_sensor sens: sensorList) {
+			if (sens.sensor_name != name)
+				continue;
 			thermalConfig[sens.tzn] = sens;
 			cmnInst.read_temperature(sens);
 			cmnInst.estimateSeverity(sens);
-			cmnInst.initThreshold(sens);
+			if (!sens.no_trip_set)
+				cmnInst.initThreshold(sens);
+			break;
 		}
 	}
 }
 
-int ThermalUtils::readTemperatures(hidl_vec<Temperature_1_0>& temp)
-{
-	std::unordered_map<int, struct therm_sensor>::iterator it;
-	int ret = 0, idx = 0;
-	std::vector<Temperature_1_0> _temp_v;
-
-	if (!is_sensor_init)
-		return 0;
-	std::lock_guard<std::mutex> _lock(sens_cb_mutex);
-	for (it = thermalConfig.begin(); it != thermalConfig.end();
-			it++, idx++) {
-		struct therm_sensor& sens = it->second;
-		Temperature_1_0 _temp;
-
-		/* v1 supports only CPU, GPU, Battery and SKIN */
-		if (sens.t.type > TemperatureType::SKIN)
-			continue;
-		ret = cmnInst.read_temperature(sens);
-		if (ret < 0)
-			return ret;
-		Notify(sens);
-		_temp.currentValue = sens.t.value;
-		_temp.name = sens.t.name;
-		_temp.type = (TemperatureType_1_0)sens.t.type;
-		_temp.throttlingThreshold = sens.thresh.hotThrottlingThresholds[
-					(size_t)sens.throt_severity];
-		_temp.shutdownThreshold = sens.thresh.hotThrottlingThresholds[
-					(size_t)ThrottlingSeverity::SHUTDOWN];
-		_temp.vrThrottlingThreshold = sens.thresh.vrThrottlingThreshold;
-		_temp_v.push_back(_temp);
-	}
-
-	temp = _temp_v;
-	return temp.size();
-}
-
-int ThermalUtils::readTemperatures(bool filterType, TemperatureType type,
-                                            hidl_vec<Temperature>& temp)
+int ThermalUtils::readTemperatures(std::vector<Temperature>& temp)
 {
 	std::unordered_map<int, struct therm_sensor>::iterator it;
 	int ret = 0;
@@ -243,7 +294,29 @@ int ThermalUtils::readTemperatures(bool filterType, TemperatureType type,
 	for (it = thermalConfig.begin(); it != thermalConfig.end(); it++) {
 		struct therm_sensor& sens = it->second;
 
-		if (filterType && sens.t.type != type)
+		ret = cmnInst.read_temperature(sens);
+		if (ret < 0)
+			return ret;
+		Notify(sens);
+		_temp.push_back(sens.t);
+	}
+
+	temp = _temp;
+	return temp.size();
+}
+
+int ThermalUtils::readTemperatures(TemperatureType type,
+                                            std::vector<Temperature>& temp)
+{
+	std::unordered_map<int, struct therm_sensor>::iterator it;
+	int ret = 0;
+	std::vector<Temperature> _temp;
+
+	std::lock_guard<std::mutex> _lock(sens_cb_mutex);
+	for (it = thermalConfig.begin(); it != thermalConfig.end(); it++) {
+		struct therm_sensor& sens = it->second;
+
+		if (sens.t.type != type)
 			continue;
 		ret = cmnInst.read_temperature(sens);
 		if (ret < 0)
@@ -256,8 +329,7 @@ int ThermalUtils::readTemperatures(bool filterType, TemperatureType type,
 	return temp.size();
 }
 
-int ThermalUtils::readTemperatureThreshold(bool filterType, TemperatureType type,
-                                            hidl_vec<TemperatureThreshold>& thresh)
+int ThermalUtils::readTemperatureThreshold(std::vector<TemperatureThreshold>& thresh)
 {
 	std::unordered_map<int, struct therm_sensor>::iterator it;
 	std::vector<TemperatureThreshold> _thresh;
@@ -265,7 +337,23 @@ int ThermalUtils::readTemperatureThreshold(bool filterType, TemperatureType type
 	for (it = thermalConfig.begin(); it != thermalConfig.end(); it++) {
 		struct therm_sensor& sens = it->second;
 
-		if (filterType && sens.t.type != type)
+		_thresh.push_back(sens.thresh);
+	}
+
+	thresh = _thresh;
+	return thresh.size();
+}
+
+int ThermalUtils::readTemperatureThreshold(TemperatureType type,
+                                            std::vector<TemperatureThreshold>& thresh)
+{
+	std::unordered_map<int, struct therm_sensor>::iterator it;
+	std::vector<TemperatureThreshold> _thresh;
+
+	for (it = thermalConfig.begin(); it != thermalConfig.end(); it++) {
+		struct therm_sensor& sens = it->second;
+
+		if (sens.t.type != type)
 			continue;
 		_thresh.push_back(sens.thresh);
 	}
@@ -274,15 +362,33 @@ int ThermalUtils::readTemperatureThreshold(bool filterType, TemperatureType type
 	return thresh.size();
 }
 
-int ThermalUtils::readCdevStates(bool filterType, cdevType type,
-                                            hidl_vec<CoolingDevice>& cdev_out)
+int ThermalUtils::readCdevStates(std::vector<CoolingDevice>& cdev_out)
 {
 	int ret = 0;
 	std::vector<CoolingDevice> _cdev;
 
 	for (struct therm_cdev cdev: cdevList) {
 
-		if (filterType && cdev.c.type != type)
+		ret = cmnInst.read_cdev_state(cdev);
+		if (ret < 0)
+			return ret;
+		_cdev.push_back(cdev.c);
+	}
+
+	cdev_out = _cdev;
+
+	return cdev_out.size();
+}
+
+int ThermalUtils::readCdevStates(cdevType type,
+                                            std::vector<CoolingDevice>& cdev_out)
+{
+	int ret = 0;
+	std::vector<CoolingDevice> _cdev;
+
+	for (struct therm_cdev cdev: cdevList) {
+
+		if (cdev.c.type != type)
 			continue;
 		ret = cmnInst.read_cdev_state(cdev);
 		if (ret < 0)
@@ -295,13 +401,7 @@ int ThermalUtils::readCdevStates(bool filterType, cdevType type,
 	return cdev_out.size();
 }
 
-int ThermalUtils::fetchCpuUsages(hidl_vec<CpuUsage>& cpu_usages)
-{
-	return cmnInst.get_cpu_usages(cpu_usages);
-}
-
-}  // namespace implementation
-}  // namespace V2_0
 }  // namespace thermal
 }  // namespace hardware
 }  // namespace android
+}  // namespace aidl

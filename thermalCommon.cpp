@@ -26,39 +26,12 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * Changes from Qualcomm Innovation Center are provided under the following license:
- *
- * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met:
- *	* Redistributions of source code must retain the above copyright
- *	  notice, this list of conditions and the following disclaimer.
- *	* Redistributions in binary form must reproduce the above
- *	  copyright notice, this list of conditions and the following
- *	  disclaimer in the documentation and/or other materials provided
- *	  with the distribution.
- *	* Neither the name of Qualcomm Innovation Center, Inc. nor the
- *	  names of its contributors may be used to endorse or promote products
- *	  derived from this software without specific prior written permission.
- *
- *
- * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED
- * BY THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS
- * AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER
- * OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- *(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+/* Changes from Qualcomm Innovation Center are provided under the following license:
+
+Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause-Clear */
 
 #include <cstdio>
 #include <cinttypes>
@@ -66,13 +39,15 @@
 #include <dirent.h>
 #include <unordered_map>
 #include <fstream>
+#include <sys/time.h>
 
 #include <android-base/logging.h>
 #include "thermalCommon.h"
 
 #define MAX_LENGTH		50
 #define MAX_PATH		(256)
-#define DEFAULT_HYSTERESIS	5000
+#define DEFAULT_HYSTERESIS	5
+#define DEFAULT_SKIN_HYSTERESIS	2
 #define THERMAL_SYSFS		"/sys/class/thermal/"
 #define TZ_DIR_NAME		"thermal_zone"
 #define TZ_DIR_FMT		"thermal_zone%d"
@@ -80,6 +55,8 @@
 #define POLICY_FILE_FORMAT	"/sys/class/thermal/thermal_zone%d/policy"
 #define TRIP_FILE_FORMAT	"/sys/class/thermal/thermal_zone%d/trip_point_1_temp"
 #define HYST_FILE_FORMAT	"/sys/class/thermal/thermal_zone%d/trip_point_1_hyst"
+#define TRIP_TYPE_FILE_FORMAT	"/sys/class/thermal/thermal_zone%d/trip_point_%d_type"
+#define TRIP_N_FILE_FORMAT	"/sys/class/thermal/thermal_zone%d/trip_point_%d_temp"
 #define USER_SPACE_POLICY	"user_space"
 #define TZ_TYPE			"type"
 #define CDEV_DIR_NAME		"cooling_device"
@@ -87,12 +64,15 @@
 #define CDEV_CUR_STATE_PATH	"/sys/class/thermal/cooling_device%d/cur_state"
 #define CPU_USAGE_FILE		"/proc/stat"
 #define CPU_ONLINE_FILE_FORMAT	"/sys/devices/system/cpu/cpu%d/online"
+#define LIMIT_PROFILE_1_SD_TEMP	125000
+#define LIMIT_PROFILE_TRIP_TYPE	"hot"
+#define LIMIT_PROFILE_SD_TZ	"aoss-0"
+#define LIMIT_PROFILE_TRIP_MAX	11
 
+namespace aidl {
 namespace android {
 namespace hardware {
 namespace thermal {
-namespace V2_0 {
-namespace implementation {
 
 static std::unordered_map<std::string, cdevType> cdev_map = {
 	{"thermal-cpufreq-0", cdevType::CPU},
@@ -111,16 +91,8 @@ static std::unordered_map<std::string, cdevType> cdev_map = {
 	{"cpufreq-cpu5", cdevType::CPU},
 	{"cpufreq-cpu6", cdevType::CPU},
 	{"cpufreq-cpu7", cdevType::CPU},
-	{"thermal-cluster-4-7", cdevType::CPU},
-	{"thermal-cluster-3-7", cdevType::CPU},
-	{"cpu-isolate0", cdevType::CPU},
-	{"cpu-isolate1", cdevType::CPU},
-	{"cpu-isolate2", cdevType::CPU},
-	{"cpu-isolate3", cdevType::CPU},
-	{"cpu-isolate4", cdevType::CPU},
-	{"cpu-isolate5", cdevType::CPU},
-	{"cpu-isolate6", cdevType::CPU},
-	{"cpu-isolate7", cdevType::CPU},
+	{"cpu-cluster0", cdevType::CPU},
+	{"cpu-cluster1", cdevType::CPU},
 	{"thermal-pause-1", cdevType::CPU},
 	{"thermal-pause-2", cdevType::CPU},
 	{"thermal-pause-4", cdevType::CPU},
@@ -131,15 +103,19 @@ static std::unordered_map<std::string, cdevType> cdev_map = {
 	{"thermal-pause-80", cdevType::CPU},
 	{"thermal-devfreq-0", cdevType::GPU},
 	{"devfreq-3d00000.qcom,kgsl-3d0", cdevType::GPU},
+	{"kgsl", cdevType::GPU},
 	{"gpu", cdevType::GPU},
 	{"modem_tj", cdevType::MODEM},
 	{"modem_lte_dsc", cdevType::MODEM},
 	{"modem_nr_dsc", cdevType::MODEM},
 	{"modem_nr_scg_dsc", cdevType::MODEM},
+	{"modem_bcl", cdevType::MODEM},
 	{"cdsp", cdevType::NPU},
 	{"cdsp_hw", cdevType::NPU},
 	{"battery", cdevType::BATTERY},
 	{"fan-max31760", cdevType::FAN},
+	{"display-fps", cdevType::DISPLAY},
+	{"panel0-backlight", cdevType::DISPLAY},
 };
 
 ThermalCommon::ThermalCommon()
@@ -148,6 +124,21 @@ ThermalCommon::ThermalCommon()
 	ncpus = (int)sysconf(_SC_NPROCESSORS_CONF);
 	if (ncpus < 1)
 		LOG(ERROR) << "Error retrieving number of cores";
+}
+
+ThermalCommon::ThermalCommon(const virtualCB &inp_cb):
+	cb(inp_cb)
+{
+	LOG(DEBUG) << "Entering " << __func__;
+	ncpus = (int)sysconf(_SC_NPROCESSORS_CONF);
+	if (ncpus < 1)
+		LOG(ERROR) << "Error retrieving number of cores";
+}
+
+ThermalCommon::~ThermalCommon()
+{
+	exitMode = true;
+	virtualThread.join();
 }
 
 static int writeToFile(std::string_view path, std::string data)
@@ -181,7 +172,7 @@ static int readLineFromFile(std::string_view path, std::string& out)
 	if (fd == NULL) {
 		LOG(ERROR) << "Path:" << std::string(path) << " file open error.err:"
 			<< strerror(errno) << std::endl;
-		return errno;
+		return -errno;
 	}
 
 	fgets_ret = fgets(buf, MAX_LENGTH, fd);
@@ -257,6 +248,8 @@ static int get_tzn(std::string sensor_name)
 		LOG(DEBUG) << "Sensor: " << sensor_name <<
 			" found at tz: " << tzn << std::endl;
 		found = tzn;
+	} else {
+		found  = -1;
 	}
 
 	closedir(tdir);
@@ -271,13 +264,39 @@ int ThermalCommon::initialize_sensor(struct target_therm_cfg& cfg, int sens_idx)
 	struct therm_sensor sensor;
 	int idx = 0;
 
-	sensor.tzn = get_tzn(cfg.sensor_list[sens_idx]);
-	if (sensor.tzn < 0) {
-		LOG(ERROR) << "No thermal zone for sensor: " <<
-			cfg.sensor_list[sens_idx] << ", ret:" <<
-			sensor.tzn << std::endl;
-		return -1;
+	if (!cfg.virtual_sensor_flag) {
+		sensor.tzn = get_tzn(cfg.sensor_list[sens_idx]);
+		if (sensor.tzn < 0) {
+			LOG(ERROR) << "No thermal zone for sensor: " <<
+				cfg.sensor_list[sens_idx] << ", ret:" <<
+				sensor.tzn << std::endl;
+			return -1;
+		}
+	} else {
+		if (cfg.vs_sensor_list.size()!= cfg.weight_list.size()) {
+			LOG(ERROR) << "Invalid virtual sensor " <<
+				cfg.sensor_list[sens_idx] << std::endl;
+			return -1;
+		}
+		sensor.tzn = get_tzn(cfg.trip_sensor_list);
+		if (sensor.tzn < 0) {
+			LOG(ERROR) << "No thermal zone for trip sensor: " <<
+				cfg.trip_sensor_list << ", ret:" <<
+				sensor.tzn << std::endl;
+			return -1;
+		}
+
+		for (int i = 0; i < cfg.vs_sensor_list.size(); i++) {
+			sensor.vs_tzns.push_back(get_tzn(cfg.vs_sensor_list[i]));
+			if (sensor.vs_tzns.at(i) < 0) {
+				LOG(ERROR) << "No thermal zone for sensor list: " <<
+				cfg.vs_sensor_list[i] << ", ret:" <<
+					sensor.vs_tzns.at(i) << std::endl;
+				return -1;
+			}
+		}
 	}
+
 	if (cfg.type == TemperatureType::CPU)
 		sensor.thresh.name = sensor.t.name =
 			std::string("CPU") + std::to_string(sens_idx);
@@ -291,37 +310,43 @@ int ThermalCommon::initialize_sensor(struct target_therm_cfg& cfg, int sens_idx)
 
 	sensor.sensor_name = cfg.sensor_list[sens_idx];
 	sensor.positiveThresh = cfg.positive_thresh_ramp;
+	sensor.no_trip_set = cfg.no_trip_set;
 	sensor.lastThrottleStatus = sensor.t.throttlingStatus =
 		ThrottlingSeverity::NONE;
 	sensor.thresh.type = sensor.t.type = cfg.type;
-	sensor.throt_severity = cfg.throt_severity;
-	sensor.thresh.vrThrottlingThreshold =
-	UNKNOWN_TEMPERATURE;
+	sensor.vs_sensor_list = cfg.vs_sensor_list;
+	sensor.weight_list = cfg.weight_list;
+	sensor.trip_sensor_list = cfg.trip_sensor_list;
+	sensor.trip_sensor_thresholds = cfg.trip_sensor_thresholds;
+	sensor.trip_sensor_thresholds_clr = cfg.trip_sensor_thresholds_clr;
+	sensor.y_intercept = cfg.y_intercept;
+	sensor.sampling_period_ms = cfg.sampling_period_ms;
+	sensor.virtual_sensor_flag = cfg.virtual_sensor_flag;
+
 	for (idx = 0; idx <= (size_t)ThrottlingSeverity::SHUTDOWN; idx++) {
-		sensor.thresh.hotThrottlingThresholds[idx] =
-		sensor.thresh.coldThrottlingThresholds[idx] =
-			UNKNOWN_TEMPERATURE;
+		sensor.thresh.hotThrottlingThresholds.push_back(UNKNOWN_TEMPERATURE);
+		sensor.thresh.coldThrottlingThresholds.push_back(UNKNOWN_TEMPERATURE);
 	}
 
-	if (cfg.throt_thresh != 0 && cfg.positive_thresh_ramp)
-		sensor.thresh.hotThrottlingThresholds[(size_t)sensor.throt_severity] =
-			cfg.throt_thresh / (float)sensor.mulFactor;
-	else if (cfg.throt_thresh != 0 && !cfg.positive_thresh_ramp)
-		sensor.thresh.coldThrottlingThresholds[(size_t)sensor.throt_severity] =
-			cfg.throt_thresh / (float)sensor.mulFactor;
-
-	if (cfg.shutdwn_thresh != 0 && cfg.positive_thresh_ramp)
-		sensor.thresh.hotThrottlingThresholds[(size_t)ThrottlingSeverity::SHUTDOWN] =
-			cfg.shutdwn_thresh / (float)sensor.mulFactor;
-	else if (cfg.shutdwn_thresh != 0 && !cfg.positive_thresh_ramp)
-		sensor.thresh.coldThrottlingThresholds[(size_t)ThrottlingSeverity::SHUTDOWN] =
-			cfg.shutdwn_thresh / (float)sensor.mulFactor;
-
-	if (cfg.vr_thresh != 0)
-		sensor.thresh.vrThrottlingThreshold =
-			cfg.vr_thresh / (float)sensor.mulFactor;
+	for (idx = 0; idx <= (size_t)ThrottlingSeverity::SHUTDOWN; idx++) {
+		if (cfg.thresh[idx] != 0 && cfg.positive_thresh_ramp)
+			sensor.thresh.hotThrottlingThresholds[idx] =
+				cfg.thresh[idx] / (float)sensor.mulFactor;
+		else if (cfg.thresh[idx] != 0 && !cfg.positive_thresh_ramp)
+			sensor.thresh.coldThrottlingThresholds[idx] =
+				cfg.thresh[idx] / (float)sensor.mulFactor;
+	}
 	sens.push_back(sensor);
-	//read_temperature((struct therm_sensor *)sensor);
+
+	if (sensor.virtual_sensor_flag) {
+		pthread_mutex_init(&waitMutex, NULL);
+		pthread_cond_init(&waitCond, NULL);
+		try {
+			virtualThread = std::thread(&ThermalCommon::TripSensorMonitorLoop, this, &sens.back());
+		} catch(...) {
+			LOG(ERROR) << "Virtual thread creation failed" << std::endl;
+		}
+	}
 
 	return 0;
 }
@@ -338,6 +363,17 @@ int ThermalCommon::initializeCpuSensor(struct target_therm_cfg& cpu_cfg)
 	return 0;
 }
 
+int ThermalCommon::initNewThermalZone(struct target_therm_cfg& cfg)
+{
+
+	if (cfg.type == TemperatureType::CPU)
+		initializeCpuSensor(cfg);
+	else
+		initialize_sensor(cfg, 0);
+
+	return 1;
+}
+
 int ThermalCommon::initThermalZones(std::vector<struct target_therm_cfg>& cfg)
 {
 	std::vector<struct target_therm_cfg>::iterator it;
@@ -349,14 +385,10 @@ int ThermalCommon::initThermalZones(std::vector<struct target_therm_cfg>& cfg)
 
 	for (it = cfg.begin(); it != cfg.end(); it++)
 	{
-		if (it->type == TemperatureType::CPU) {
-			if (initializeCpuSensor(*it) < 0)
-				return -1;
-			continue;
-		}
-		if (initialize_sensor(*it, 0) < 0) {
-			return -1;
-		}
+		if (it->type == TemperatureType::CPU)
+			initializeCpuSensor(*it);
+		else
+			initialize_sensor(*it, 0);
 	}
 
 	return sens.size();
@@ -463,21 +495,21 @@ int ThermalCommon::estimateSeverity(struct therm_sensor& sensor)
 	int idx = 0;
 	ThrottlingSeverity severity = ThrottlingSeverity::NONE;
 	float temp = sensor.t.value;
+	int hysteresis = (sensor.thresh.type == TemperatureType::SKIN) ?
+				DEFAULT_SKIN_HYSTERESIS : DEFAULT_HYSTERESIS;
 
 	for (idx = (int)ThrottlingSeverity::SHUTDOWN; idx >= 0; idx--) {
 		/* If a particular threshold is hit already, check if the
 		 * hysteresis is cleared before changing the severity */
-		if (idx == (int)sensor.t.throttlingStatus) {
+		if (idx <= (int)sensor.t.throttlingStatus) {
 			if ((sensor.positiveThresh &&
 				!isnan(sensor.thresh.hotThrottlingThresholds[idx]) &&
 				temp >=
-				(sensor.thresh.hotThrottlingThresholds[idx] -
-				DEFAULT_HYSTERESIS / sensor.mulFactor)) ||
+				(sensor.thresh.hotThrottlingThresholds[idx] - hysteresis)) ||
 				(!sensor.positiveThresh &&
 				!isnan(sensor.thresh.coldThrottlingThresholds[idx]) &&
 				temp <=
-				(sensor.thresh.coldThrottlingThresholds[idx] +
-				DEFAULT_HYSTERESIS / sensor.mulFactor)))
+				(sensor.thresh.coldThrottlingThresholds[idx] + hysteresis)))
 				break;
 			continue;
 		}
@@ -493,7 +525,7 @@ int ThermalCommon::estimateSeverity(struct therm_sensor& sensor)
 	}
 	if (idx >= 0)
 		severity = (ThrottlingSeverity)(idx);
-	LOG(INFO) << "Sensor Name:" << sensor.t.name << "temp: " <<
+	LOG(DEBUG) << "Sensor Name:" << sensor.t.name << "temp: " <<
 		temp << ". prev severity:" <<
 		(int)sensor.lastThrottleStatus << ". cur severity:" <<
 		(int)sensor.t.throttlingStatus << " New severity:" <<
@@ -503,7 +535,82 @@ int ThermalCommon::estimateSeverity(struct therm_sensor& sensor)
 	sensor.lastThrottleStatus = sensor.t.throttlingStatus;
 	sensor.t.throttlingStatus = severity;
 
+	if (sensor.sensor_name == "disp-lea-left" || sensor.sensor_name == "disp-lea-right") {
+		ThrottlingSeverity cur_severity =
+				std::max(left_display_throttle_severity, right_display_throttle_severity);
+		if (sensor.sensor_name == "disp-lea-left") {
+			left_display_throttle_severity = severity;
+		} else if (sensor.sensor_name == "disp-lea-right") {
+			right_display_throttle_severity = severity;
+		}
+
+		ThrottlingSeverity new_severity =
+				std::max(left_display_throttle_severity, right_display_throttle_severity);
+
+		LOG(DEBUG) << "Current display severity: " << (int)cur_severity
+			<< " New severity L: " << (int)left_display_throttle_severity
+			<< " New severity R: " << (int)right_display_throttle_severity
+			<< " New severity combined: " << (int)new_severity << std::endl;
+
+		if (cur_severity != new_severity) {
+			return (int)new_severity;
+		} else {
+			return -1;
+		}
+	}
+
 	return (int)severity;
+}
+
+int ThermalCommon::virtual_sensor_read_temperature(struct therm_sensor& sensor)
+{
+	char file_name[MAX_PATH];
+	double temp = 0, value = 0;
+	std::string buf;
+	int ret = 0, ct = 0;
+	bool read_ok = false;
+
+	if (!sensor.virtual_sensor_flag)
+		return -1;
+
+	for (int i = 0; i < sensor.vs_sensor_list.size(); i++) {
+		do {
+			snprintf(file_name, sizeof(file_name), TEMPERATURE_FILE_FORMAT,
+				sensor.vs_tzns.at(i));
+			ret = readLineFromFile(std::string(file_name), buf);
+			if (ret <= 0) {
+				LOG(ERROR) << "Temperature read error:"<< ret <<
+					" for sensor " << sensor.vs_sensor_list[i];
+				return -1;
+			}
+			value = (float)std::stoi(buf, nullptr, 0);
+			try {
+				LOG(DEBUG) << "VS Temperature read: "<< value <<
+					" for sensor " << sensor.vs_sensor_list[i];
+				value *= sensor.weight_list[i];
+				temp += value;
+				read_ok = true;
+			}
+			catch (std::exception &err) {
+				LOG(ERROR) << "Temperature buf stoi error: "
+				<< err.what()
+				<< " buf:" << buf << " sensor:"
+				<< sensor.vs_sensor_list[i] << " TZ:"
+				<< sensor.vs_tzns.at(i) << std::endl;
+			}
+			ct++;
+		} while (!read_ok && ct < RETRY_CT);
+
+		if (!read_ok)
+			return -1;
+	}
+	temp += (float)sensor.y_intercept;
+	sensor.t.value = temp / (float)sensor.mulFactor;
+
+	LOG(DEBUG) << "Sensor Name:" << sensor.t.name << ". Temperature:" <<
+		(float)sensor.t.value << std::endl;
+
+	return ret;
 }
 
 int ThermalCommon::read_temperature(struct therm_sensor& sensor)
@@ -513,6 +620,9 @@ int ThermalCommon::read_temperature(struct therm_sensor& sensor)
 	std::string buf;
 	int ret = 0, ct = 0;
 	bool read_ok = false;
+
+	if (sensor.virtual_sensor_flag)
+		return virtual_sensor_read_temperature(sensor);
 
 	do {
 		snprintf(file_name, sizeof(file_name), TEMPERATURE_FILE_FORMAT,
@@ -550,6 +660,8 @@ void ThermalCommon::initThreshold(struct therm_sensor& sensor)
 	int ret = 0, idx;
 	ThrottlingSeverity severity = ThrottlingSeverity::NONE;
 	int next_trip, curr_trip, hyst_temp = 0;
+	int hysteresis = (sensor.thresh.type == TemperatureType::SKIN) ?
+				DEFAULT_SKIN_HYSTERESIS : DEFAULT_HYSTERESIS;
 
 	LOG(DEBUG) << "Entering " <<__func__;
 	if (!sensor.positiveThresh) {
@@ -595,105 +707,166 @@ void ThermalCommon::initThreshold(struct therm_sensor& sensor)
 				(int)sensor.t.throttlingStatus]
 					* sensor.mulFactor;
 		if (!isnan(next_trip))
-			hyst_temp = (next_trip - curr_trip) + DEFAULT_HYSTERESIS;
+			hyst_temp = (next_trip - curr_trip) + (hysteresis *
+					sensor.mulFactor);
 		else
-			hyst_temp = DEFAULT_HYSTERESIS;
+			hyst_temp = hysteresis * sensor.mulFactor;
+
+	/* trip_point_x_hyst is no more writable,disable it until it properly handle it */
+#if 0
 		LOG(DEBUG) << "Sensor: " << sensor.t.name << " hysteresis:"
 			<< hyst_temp << std::endl;
 		snprintf(file_name, sizeof(file_name), HYST_FILE_FORMAT,
 				sensor.tzn);
 		writeToFile(std::string_view(file_name), std::to_string(hyst_temp));
+#endif
 	}
 
 	return;
 }
 
-int ThermalCommon::get_cpu_usages(hidl_vec<CpuUsage>& list) {
-	int vals, cpu_num, online;
-	ssize_t read;
-	uint64_t user, nice, system, idle, active, total;
-	char *line = NULL;
-	size_t len = 0;
-	size_t cpu = 0;
-	char file_name[MAX_LENGTH];
-	FILE *file;
-	FILE *cpu_file;
-
-	list.resize(ncpus);
-	file = fopen(CPU_USAGE_FILE, "r");
-	if (file == NULL) {
-		LOG(ERROR) << "failed to open:" << CPU_USAGE_FILE <<
-			" err:" << strerror(errno);
-		return -errno;
+int ThermalCommon::findLimitProfile(void)
+{
+	char file_name[MAX_PATH];
+	std::string buf;
+	int trip = 1, lp = -1;
+	int ct = 0, ret = 0;
+	bool read_ok = false;
+	int tzn = get_tzn(LIMIT_PROFILE_SD_TZ);
+	if (tzn < 0) {
+		LOG(ERROR) <<" Not able to get tz id for "
+		         << LIMIT_PROFILE_SD_TZ << std::endl;
+		return -1;
 	}
 
-	while ((read = getline(&line, &len, file)) != -1) {
-		if (strnlen(line, read) < 4 || strncmp(line, "cpu", 3) != 0 ||
-				!isdigit(line[3])) {
-			free(line);
-			line = NULL;
-			len = 0;
+	do {
+		snprintf(file_name, sizeof(file_name), TRIP_TYPE_FILE_FORMAT,
+			tzn, trip);
+		ret = readFromFile(std::string_view(file_name), buf);
+		if (ret <= 0) {
+			LOG(ERROR) <<" Not able to read trip type trip: "
+					<< trip << std::endl;
+			return -1;
+		}
+		if (strncmp(buf.c_str(), LIMIT_PROFILE_TRIP_TYPE,
+					strlen(LIMIT_PROFILE_TRIP_TYPE))) {
+			trip++;
+			if (trip > LIMIT_PROFILE_TRIP_MAX)
+				return -1;
 			continue;
 		}
-		vals = sscanf(line, \
-			"cpu%d %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64, \
-			&cpu_num, &user, &nice, &system, &idle);
 
-		free(line);
-		line = NULL;
-		len = 0;
-
-		if (vals != 5 || cpu == ncpus) {
-			if (vals != 5) {
-				LOG(ERROR) <<
-				"failed to read CPU information from file: "
-				<< strerror(errno);
-			} else {
-				LOG(ERROR) <<
-					"/proc/stat file has incorrect format.";
+		snprintf(file_name, sizeof(file_name), TRIP_N_FILE_FORMAT,
+				tzn, trip);
+		do {
+			ret = readFromFile(std::string_view(file_name), buf);
+			if (ret <= 0) {
+				LOG(ERROR) <<" Not able to read trip temp, id: "
+					<< trip << std::endl;
+				return -1;
 			}
-			fclose(file);
-			return errno ? -errno : -EIO;
-		}
+			try {
+				lp = std::stoi(buf, nullptr, 0);
+				read_ok = true;
+			}
+			catch (std::exception &err) {
+				LOG(ERROR) <<"limits profile stoi err:"
+					<< err.what() << " buf:" << buf;
+			}
+			ct++;
+		} while (!read_ok && ct < RETRY_CT);
 
-		active = user + nice + system;
-		total = active + idle;
+		lp = lp == LIMIT_PROFILE_1_SD_TEMP ? 1 : 0;
 
-		// Read online CPU information.
-		snprintf(file_name, MAX_LENGTH, CPU_ONLINE_FILE_FORMAT,
-				cpu_num);
-		cpu_file = fopen(file_name, "r");
-		online = 0;
-		if (cpu_file == NULL) {
-			LOG(ERROR) << "failed to open file:" << file_name <<
-				" err: " << strerror(errno);
-			fclose(file);
-			return -errno;
-		}
-		if (1 != fscanf(cpu_file, "%d", &online)) {
-			LOG(ERROR) << "failed to read CPU online information" << strerror(errno);
-			fclose(file);
-			fclose(cpu_file);
-			return errno ? -errno : -EIO;
-		}
-		fclose(cpu_file);
+		break;
+	} while (1);
 
-		list[cpu].name = std::string("CPU") + std::to_string(cpu_num);
-		list[cpu].active = active;
-		list[cpu].total = total;
-		list[cpu].isOnline = online;
-		cpu++;
-	}
-	fclose(file);
-	if (cpu != ncpus) {
-		LOG(ERROR) <<"/proc/stat file has incorrect format.";
-		return -EIO;
-	}
-	return ncpus;
+	return lp;
 }
 
-}  // namespace implementation
-}  // namespace V2_0
-}  // namespace thermal
-}  // namespace hardware
-}  // namespace android
+int ThermalCommon::read_trip_temperature(struct therm_sensor& sensor)
+{
+	char file_name[MAX_PATH];
+	int temp = INT_MIN;
+	std::string buf;
+	int ret = 0, ct = 0;
+	bool read_ok = false;
+
+	do {
+		snprintf(file_name, sizeof(file_name), TEMPERATURE_FILE_FORMAT,
+			sensor.tzn);
+		ret = readLineFromFile(std::string(file_name), buf);
+		if (ret <= 0) {
+			LOG(ERROR) << "Temperature read error:"<< ret <<
+				" for sensor " << sensor.t.name;
+			return -1;
+		}
+		temp = std::stoi(buf, nullptr, 0);
+		try {
+			read_ok = true;
+		}
+		catch (std::exception &err) {
+			LOG(ERROR) << "Temperature buf stoi error: "
+				<< err.what()
+				<< " buf:" << buf << " sensor:"
+				<< sensor.t.name << " TZ:" <<
+				sensor.tzn << std::endl;
+		}
+		ct++;
+	} while (!read_ok && ct < RETRY_CT);
+
+	if (!read_ok)
+		return -1;
+
+	return temp;
+}
+
+void ThermalCommon::TripSensorMonitorLoop(struct therm_sensor *vs)
+{
+	struct timespec time_val;
+	char file_name[MAX_PATH];
+	int ret = 0, temp = 0;
+	std::string buf;
+
+	if (!vs->virtual_sensor_flag)
+		return;
+
+	pthread_mutex_lock(&waitMutex);
+	/* Temperature can be >= trip before we start */
+	temp = read_trip_temperature(*vs);
+	if (temp >= vs->trip_sensor_thresholds)
+		pollingMode = true;
+
+	while (!exitMode) {
+		/* Poll if polling mode is true OR if throttling status is not NONE */
+		if (pollingMode || vs->t.throttlingStatus != ThrottlingSeverity::NONE) {
+			clock_gettime(CLOCK_REALTIME, &time_val);
+			time_val.tv_sec += vs->sampling_period_ms / 1000;
+			time_val.tv_nsec += (vs->sampling_period_ms % 1000) * 1000000;
+			pthread_cond_timedwait(&waitCond, &waitMutex,
+								&time_val);
+		} else {
+			pthread_cond_wait(&waitCond, &waitMutex);
+		}
+
+		ret = virtual_sensor_read_temperature(*vs);
+		if (ret < 0)
+			continue;
+
+		int severity = estimateSeverity(*vs);
+		if (severity != -1) {
+			LOG(ERROR) << "sensor: " << vs->sensor_name <<" temperature: "
+				<< vs->t.value << " old: " <<
+				(int)vs->lastThrottleStatus << " new: " <<
+				(int)vs->t.throttlingStatus << std::endl;
+			cb(vs);
+		}
+	}
+
+	pthread_mutex_unlock(&waitMutex);
+	return;
+}
+}// namespace thermal
+}// namespace hardware
+}// namespace android
+}// namespace aidl
