@@ -29,6 +29,10 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* Changes from Qualcomm Innovation Center are provided under the following license:
+
+Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause-Clear */
 
 #ifndef THERMAL_THERMAL_MONITOR_NETLINK_H__
 #define THERMAL_THERMAL_MONITOR_NETLINK_H__
@@ -38,22 +42,23 @@
 #include <netlink/genl/mngt.h>
 #include <netlink/genl/ctrl.h>
 #include <netlink/netlink.h>
-#include <android/hardware/thermal/2.0/IThermal.h>
+#include <aidl/android/hardware/thermal/BnThermal.h>
 
+namespace aidl{
 namespace android {
 namespace hardware {
 namespace thermal {
-namespace V2_0 {
-namespace implementation {
 
+using eventMonCB = std::function<void(int, int, int)>;
 using eventMonitorCB = std::function<void(int, int)>;
 using eventCreateMonitorCB = std::function<void(int, const char *)>;
 
 class ThermalMonitor {
 	public:
-		ThermalMonitor(const eventMonitorCB &inp_event_cb,
+		ThermalMonitor(const eventMonCB &inp_event_cb,
 			const eventMonitorCB &inp_sample_cb,
-			const eventCreateMonitorCB &inp_event_create_cb);
+			const eventCreateMonitorCB &inp_event_create_cb,
+			const eventMonitorCB &inp_event_cdev_cb);
 		~ThermalMonitor();
 
 		void parse_and_notify(char *inp_buf, ssize_t len);
@@ -70,17 +75,18 @@ class ThermalMonitor {
 		struct nl_sock *event_soc, *sample_soc;
 		int event_group, sample_group;
 		bool monitor_shutdown;
-		eventMonitorCB event_cb, sample_cb;
+		eventMonCB event_cb;
+		eventMonitorCB sample_cb;
 		eventCreateMonitorCB event_create_cb;
+		eventMonitorCB  cdev_cb;
 
 		int fetch_group_id();
 		int send_nl_msg(struct nl_msg *msg);
 };
 
-}  // namespace implementation
-}  // namespace V2_0
 }  // namespace thermal
 }  // namespace hardware
 }  // namespace android
+}  // namespace aidl
 
 #endif  // THERMAL_THERMAL_MONITOR_NETLINK_H__
